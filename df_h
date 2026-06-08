@@ -1,0 +1,49 @@
+df -Th | awk -v d="$(date '+%Y-%m-%d %H:%M:%S')" -v h="$(hostname -s)" 'NR>1{fs=$1;t=$2;s=$3;u=$4;a=$5;p=$6;gsub(/%/,"",p);m=$7;for(i=8;i<=NF;i++)m=m" "$i;printf "%s|%s|%s|%s|%s|%s|%s|%s|%s\n",d,h,fs,t,s,u,a,p,m}'
+
+
+
+  - name: Run one-liner df and append to flat file
+  shell: |
+    df -Th | awk -v d="$(date '+%Y-%m-%d %H:%M:%S')" -v h="$(hostname -s)" '
+    NR==1 {next}
+    {
+        fs=$1; type=$2; size=$3; used=$4; avail=$5; usepct=$6; 
+        mount=$7; for(i=8;i<=NF;i++) mount=mount" "$i;
+        gsub(/%/,"",usepct);
+        printf "%s|%s|%s|%s|%s|%s|%s|%s|%s\n", d, h, fs, type, size, used, avail, usepct, mount
+    }' >> /opt/db_metrics/df_history/df_usage_$(date +%Y-%m-%d).txt
+  become: yes
+
+  df -Th | awk -v d="$(date '+%Y-%m-%d %H:%M:%S')" -v h="$(hostname -s)" '
+NR==1 {print "load_date|server_name|filesystem|type|size|used|avail|use_pct|mounted_on"; next}
+{
+    fs=$1; type=$2; size=$3; used=$4; avail=$5; usepct=$6; 
+    mount=$7; for(i=8;i<=NF;i++) mount=mount" "$i;
+    gsub(/%/,"",usepct);
+    printf "%s|%s|%s|%s|%s|%s|%s|%s|%s\n", d, h, fs, type, size, used, avail, usepct, mount
+}'
+
+
+
+  #!/bin/bash
+# File: /usr/local/bin/df_custom.sh
+# Make it executable: chmod +x /usr/local/bin/df_custom.sh
+
+HOSTNAME=$(hostname -s)
+LOAD_DATE=$(date '+%Y-%m-%d %H:%M:%S')
+
+echo "load_date|server_name|filesystem|type|size|used|avail|use_pct|mounted_on"
+
+# Run df -Th and format output
+df -Th | tail -n +2 | while read -r line; do
+    # Parse the line safely
+    FS=$(echo "$line" | awk '{print $1}')
+    TYPE=$(echo "$line" | awk '{print $2}')
+    SIZE=$(echo "$line" | awk '{print $3}')
+    USED=$(echo "$line" | awk '{print $4}')
+    AVAIL=$(echo "$line" | awk '{print $5}')
+    USEPCT=$(echo "$line" | awk '{print $6}' | tr -d '%')
+    MOUNT=$(echo "$line" | awk '{for(i=7;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+
+    echo "${LOAD_DATE}|${HOSTNAME}|${FS}|${TYPE}|${SIZE}|${USED}|${AVAIL}|${USEPCT}|${MOUNT}"
+done
