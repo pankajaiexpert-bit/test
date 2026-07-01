@@ -1,0 +1,127 @@
+WITH 
+-- Base usage (filter last 30 days for performance; adjust as needed)
+usage_base AS (
+  SELECT 
+    u.*,
+    COALESCE(u.identity_metadata.run_as, u.identity_metadata.owned_by) AS identity_name,  -- User or Service Principal
+    u.billing_origin_product,
+    u.usage_metadata.cluster_id,
+    u.usage_metadata.warehouse_id,
+    u.usage_metadata.job_id,
+    u.usage_metadata.instance_pool_id,
+    u.product_features.is_serverless,
+    u.product_features.is_photon,
+    u.sku_name,
+    DATE_TRUNC('week', u.usage_date) AS usage_week
+  FROM system.billing.usage u
+  WHERE u.usage_date >= CURRENT_DATE() - INTERVAL 30 DAYS
+    AND u.record_type = 'ORIGINAL'  -- Ignore corrections for clean agg
+    AND u.usage_quantity > 0
+),
+
+-- Pricing join for USD estimates
+priced_usage AS (
+  SELECT 
+    ub.*,
+    p.pricing.effective_list.default AS list_price_per_unit,
+    ub.usage_quantity * COALESCE(p.pricing.effective_list.default, 0) AS est_usd
+  FROM usage_base ub
+  LEFT JOIN system.billing.list_prices p 
+    ON ub.sku_name = p.sku_name 
+    AND ub.usage_end_time >= p.price_start_time 
+    AND (p.price_end_time IS NULL OR ub.usage_end_time < p.price_end_time)
+),
+
+-- Aggregations
+daily_agg AS (
+  SELECT 
+    workspace_id,
+    usage_date,
+    identity_name,
+    billing_origin_product,
+    CASE 
+      WHEN warehouse_id IS NOT NULL THEN 'SQL_WAREHOUSE'
+      WHEN cluster_id IS NOT NULL THEN 'CLUSTER'
+      WHEN job_id IS NOT NULL THEN 'JOB'
+      ELSE 'OTHER'
+    END AS compute_type,
+    MAX(is_serverless) AS is_serverless_flag,
+    MAX(is_photon) AS is_photon_flag,
+    SUM(usage_quantity) AS total_dbus,
+    SUM(est_usd) AS est_total_usd,
+    COUNT(DISTINCT cluster_id) AS distinct_clusters,
+    COUNT(DISTINCT warehouse_id) AS distinct_warehouses
+  FROM priced_usage
+  GROUP BY workspace_id, usage_date, identity_name, billing_origin_product, compute_type
+),
+
+weekly_agg AS (
+  SELECT 
+    workspace_id,
+    usage_week,
+    identity_name,
+    compute_type,
+    SUM(total_dbus) AS weekly_dbus,
+    SUM(est_total_usd) AS weekly_usd,
+    AVG(total_dbus) AS avg_daily_dbus
+  FROM daily_agg
+  GROUP BY workspace_id, usage_week, identity_name, compute_type
+),
+
+-- Trends & Growth
+trends AS (
+  SELECT 
+    identity_name,
+    compute_type,
+    SUM(CASE WHEN usage_date >= CURRENT_DATE() - INTERVAL 7 DAYS THEN total_dbus ELSE 0 END) AS last_7d_dbus,
+    SUM(CASE WHEN usage_date BETWEEN CURRENT_DATE() - INTERVAL 14 DAYS AND CURRENT_DATE() - INTERVAL 7 DAYS THEN total_dbus ELSE 0 END) AS prev_7d_dbus,
+    (SUM(CASE WHEN usage_date >= CURRENT_DATE() - INTERVAL 7 DAYS THEN total_dbus ELSE 0 END) - 
+     SUM(CASE WHEN usage_date BETWEEN CURRENT_DATE() - INTERVAL 14 DAYS AND CURRENT_DATE() - INTERVAL 7 DAYS THEN total_dbus ELSE 0 END)) 
+     * 100.0 / NULLIF(SUM(CASE WHEN usage_date BETWEEN CURRENT_DATE() - INTERVAL 14 DAYS AND CURRENT_DATE() - INTERVAL 7 DAYS THEN total_dbus ELSE 0 END), 0) AS wow_growth_pct
+  FROM daily_agg
+  GROUP BY identity_name, compute_type
+)
+
+-- Final 360° Report with Recommendations
+SELECT 
+  da.workspace_id,
+  da.usage_date,
+  da.identity_name,
+  da.compute_type,
+  da.billing_origin_product,
+  da.total_dbus,
+  ROUND(da.est_total_usd, 2) AS est_usd,
+  da.is_serverless_flag,
+  da.is_photon_flag,
+  t.wow_growth_pct,
+  wa.weekly_dbus,
+  wa.weekly_usd,
+  
+  -- Powerful Recommendations (case logic for 360° coverage)
+  CASE 
+    WHEN da.compute_type = 'CLUSTER' AND da.is_serverless_flag = FALSE 
+      THEN 'HIGH IMPACT: Migrate to Job Compute or Serverless Jobs (2-3x cheaper). Enable auto-termination (30-60 min idle).'
+    WHEN da.compute_type = 'SQL_WAREHOUSE' AND da.is_serverless_flag = FALSE 
+      THEN 'Migrate to Serverless SQL Warehouse for auto-scale-to-zero. Set short auto-stop (5-10 min). Right-size based on queueing.'
+    WHEN da.total_dbus > 1000 AND da.is_photon_flag = FALSE 
+      THEN 'Enable Photon acceleration + latest DBR runtime for 20-50%+ savings on compute.'
+    WHEN t.wow_growth_pct > 30 
+      THEN 'ALERT: >30% WoW growth - Review workloads, add budgets/usage policies, enforce tags.'
+    WHEN da.distinct_clusters > 5 OR da.distinct_warehouses > 3 
+      THEN 'Consolidate clusters/warehouses. Use Instance Pools + Fleet instances (Graviton2 preferred on AWS).'
+    WHEN da.billing_origin_product = 'ALL_PURPOSE' 
+      THEN 'CRITICAL: Shift interactive work off All-Purpose Compute to dedicated Job/SQL compute.'
+    ELSE 'Good: Monitor tags, enforce cluster policies, review AWS CUR for infra costs.'
+  END AS recommendation,
+
+  -- Additional Context
+  'Tag all resources (team, project, owner). Use cluster policies & budgets. Check system.compute.clusters for owners.' AS next_steps
+
+FROM daily_agg da
+LEFT JOIN trends t ON da.identity_name = t.identity_name AND da.compute_type = t.compute_type
+LEFT JOIN weekly_agg wa ON da.workspace_id = wa.workspace_id 
+  AND da.identity_name = wa.identity_name 
+  AND da.compute_type = wa.compute_type 
+  AND DATE_TRUNC('week', da.usage_date) = wa.usage_week
+ORDER BY da.est_total_usd DESC, da.total_dbus DESC
+LIMIT 500;  -- Adjust or use in dashboard with filters
