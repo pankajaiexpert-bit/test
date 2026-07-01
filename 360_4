@@ -1,0 +1,141 @@
+WITH 
+-- Base usage focused on jobs & interactive workloads
+usage_base AS (
+  SELECT 
+    u.workspace_id,
+    u.usage_date,
+    DATE_TRUNC('week', u.usage_date) AS usage_week,
+    DATE_TRUNC('month', u.usage_date) AS usage_month,
+    COALESCE(u.identity_metadata.run_as, 'UNKNOWN') AS identity_name,
+    u.billing_origin_product,
+    u.usage_metadata.job_id,
+    u.usage_metadata.job_name,
+    u.usage_metadata.notebook_path,
+    u.usage_metadata.cluster_id,
+    u.sku_name,
+    u.usage_quantity AS dbus,
+    u.product_features.is_serverless,
+    u.product_features.jobs_tier,
+    u.custom_tags
+  FROM system.billing.usage u
+  WHERE u.usage_date >= CURRENT_DATE() - INTERVAL 90 DAYS
+    AND u.record_type = 'ORIGINAL'
+    AND u.usage_quantity > 0
+    AND (u.billing_origin_product IN ('JOBS', 'INTERACTIVE') 
+         OR u.usage_metadata.job_id IS NOT NULL 
+         OR u.usage_metadata.notebook_path IS NOT NULL)
+),
+
+-- Pricing
+priced AS (
+  SELECT 
+    ub.*,
+    COALESCE(lp.pricing.effective_list.default, 0) AS list_price_per_dbu,
+    ub.dbus * COALESCE(lp.pricing.effective_list.default, 0) AS est_usd
+  FROM usage_base ub
+  LEFT JOIN system.billing.list_prices lp 
+    ON ub.sku_name = lp.sku_name 
+    AND ub.usage_date >= DATE(lp.price_start_time)
+    AND (lp.price_end_time IS NULL OR ub.usage_date < DATE(lp.price_end_time))
+),
+
+-- Enrich with Job & Compute metadata
+enriched AS (
+  SELECT 
+    p.*,
+    j.name AS job_name_clean,
+    j.run_as_user,
+    c.cluster_source,
+    c.auto_termination_minutes,
+    c.cluster_name
+  FROM priced p
+  LEFT JOIN (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY workspace_id, job_id ORDER BY change_time DESC) rn
+    FROM system.lakeflow.jobs
+  ) j ON p.job_id = j.job_id AND j.rn = 1 AND p.workspace_id = j.workspace_id
+  LEFT JOIN (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC) rn
+    FROM system.compute.clusters
+  ) c ON p.cluster_id = c.cluster_id AND c.rn = 1 AND p.workspace_id = c.workspace_id
+),
+
+-- Aggregations
+agg AS (
+  SELECT 
+    workspace_id,
+    usage_date,
+    usage_week,
+    usage_month,
+    identity_name,
+    job_id,
+    COALESCE(job_name_clean, job_name, notebook_path, 'Unnamed_Workload') AS workload_name,
+    cluster_source,
+    is_serverless,
+    SUM(dbus) AS total_dbus,
+    ROUND(SUM(est_usd), 2) AS est_usd,
+    COUNT(DISTINCT usage_date) AS active_days,
+    AVG(auto_termination_minutes) AS avg_auto_term_mins
+  FROM enriched
+  GROUP BY ALL
+),
+
+-- Serverless Savings Estimation (conservative 40-60% savings assumption based on Databricks benchmarks)
+savings_calc AS (
+  SELECT 
+    *,
+    CASE 
+      WHEN is_serverless = TRUE THEN 0
+      WHEN cluster_source = 'ALL_PURPOSE' OR billing_origin_product = 'INTERACTIVE' THEN est_usd * 0.55   -- ~55% savings typical
+      WHEN cluster_source = 'JOB' THEN est_usd * 0.35                                            -- ~35% additional on top of Job Compute
+      ELSE est_usd * 0.40
+    END AS potential_daily_savings_usd,
+    CASE 
+      WHEN is_serverless = TRUE THEN 0
+      ELSE total_dbus * 0.45 
+    END AS potential_daily_savings_dbu
+  FROM agg
+)
+
+-- FINAL SUPER 360° SERVERLESS MIGRATION REPORT
+SELECT 
+  workspace_id,
+  usage_date,
+  identity_name,
+  workload_name,
+  job_id,
+  cluster_source,
+  is_serverless,
+  total_dbus,
+  est_usd,
+  active_days,
+  potential_daily_savings_usd,
+  potential_daily_savings_dbu,
+  potential_daily_savings_usd * 7 AS potential_weekly_savings_usd,
+  potential_daily_savings_usd * 30 AS potential_monthly_savings_usd,
+  ROUND(potential_daily_savings_usd * active_days, 2) AS realized_savings_if_migrated_to_date,
+  
+  -- Super FinOps Recommendations
+  CASE 
+    WHEN is_serverless = TRUE THEN 'Already Optimized ✓'
+    WHEN potential_daily_savings_usd > 100 THEN 'CRITICAL - Migrate Now'
+    WHEN potential_daily_savings_usd > 20 THEN 'HIGH PRIORITY'
+    ELSE 'Medium/Low Priority'
+  END AS priority,
+  
+  CASE 
+    WHEN is_serverless = FALSE AND (cluster_source = 'ALL_PURPOSE' OR billing_origin_product = 'INTERACTIVE')
+      THEN 'Migrate ' || workload_name || ' (' || identity_name || ') to Serverless Jobs / Serverless Notebooks. Expected savings: $' 
+           || ROUND(potential_daily_savings_usd, 2) || '/day (' || ROUND(potential_daily_savings_dbu, 0) || ' DBU).'
+    WHEN is_serverless = FALSE AND cluster_source = 'JOB'
+      THEN 'Enable Serverless for Job ' || workload_name || '. Additional 30-40% savings possible.'
+    WHEN avg_auto_term_mins > 60 OR avg_auto_term_mins IS NULL
+      THEN 'First enable auto-termination (≤30 min), then migrate to Serverless.'
+    ELSE 'Ready for Serverless migration. Use Job Compute + Serverless where possible.'
+  END AS super_recommendation,
+
+  'FinOps Actions: 1. Update job settings to use Serverless. 2. Add usage policy/budget. 3. Enforce tags. 4. Monitor via this query. 5. Review long-running notebooks for optimization.' AS action_plan
+
+FROM savings_calc
+WHERE potential_daily_savings_usd > 5   -- Focus on meaningful opportunities
+ORDER BY potential_daily_savings_usd DESC, est_usd DESC
+LIMIT 1500;
