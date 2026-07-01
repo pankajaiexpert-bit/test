@@ -1,0 +1,228 @@
+WITH 
+-- 1. Base Usage with Heavy Filtering & Core Metadata
+usage_base AS (
+  SELECT 
+    u.account_id,
+    u.workspace_id,
+    u.usage_date,
+    DATE_TRUNC('week', u.usage_date) AS usage_week,
+    DATE_TRUNC('month', u.usage_date) AS usage_month,
+    COALESCE(
+      u.identity_metadata.run_as, 
+      u.identity_metadata.owned_by, 
+      u.identity_metadata.created_by, 
+      'UNKNOWN_IDENTITY'
+    ) AS identity_name,  -- User or Service Principal
+    u.billing_origin_product,
+    u.sku_name,
+    u.usage_quantity,
+    u.est_usd,  -- Will calculate below
+    u.usage_metadata.cluster_id,
+    u.usage_metadata.warehouse_id,
+    u.usage_metadata.job_id,
+    u.usage_metadata.job_run_id,
+    u.usage_metadata.instance_pool_id,
+    u.product_features.is_serverless,
+    u.product_features.is_photon,
+    u.product_features.sql_tier,
+    u.product_features.jobs_tier,
+    u.custom_tags,
+    u.record_type
+  FROM system.billing.usage u
+  WHERE u.usage_date >= CURRENT_DATE() - INTERVAL 90 DAYS
+    AND u.record_type = 'ORIGINAL'
+    AND u.usage_quantity > 0
+),
+
+-- 2. Pricing for Accurate USD Estimates
+priced_usage AS (
+  SELECT 
+    ub.*,
+    COALESCE(lp.pricing.effective_list.default, 0) AS list_price_per_unit,
+    ub.usage_quantity * COALESCE(lp.pricing.effective_list.default, 0) AS est_usd
+  FROM usage_base ub
+  LEFT JOIN system.billing.list_prices lp 
+    ON ub.sku_name = lp.sku_name 
+    AND ub.usage_date >= DATE(lp.price_start_time)
+    AND (lp.price_end_time IS NULL OR ub.usage_date < DATE(lp.price_end_time))
+),
+
+-- 3. Deep Enrichment: Clusters, Warehouses, Jobs, Query History
+enriched AS (
+  SELECT 
+    p.*,
+    -- Compute
+    c.cluster_name,
+    c.cluster_source,           -- ALL_PURPOSE, JOB, etc.
+    c.owned_by AS cluster_owner,
+    c.auto_termination_minutes,
+    c.enable_elastic_disk,
+    c.spark_version,
+    c.num_workers,
+    -- SQL Warehouse
+    w.warehouse_name,
+    w.warehouse_type,           -- SERVERLESS, PRO, CLASSIC
+    w.auto_stop_mins,
+    w.scaling_min, 
+    w.scaling_max,
+    -- Jobs
+    j.name AS job_name,
+    j.timeout_seconds,
+    j.max_concurrent_runs,
+    -- Query Performance (for SQL-heavy)
+    qh.total_duration_ms,
+    qh.executed_as,
+    qh.statement_text
+  FROM priced_usage p
+  -- Latest Cluster State
+  LEFT JOIN (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC) rn
+    FROM system.compute.clusters
+  ) c ON p.cluster_id = c.cluster_id AND c.rn = 1 AND p.workspace_id = c.workspace_id
+  -- Latest Warehouse State
+  LEFT JOIN (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY workspace_id, warehouse_id ORDER BY change_time DESC) rn
+    FROM system.compute.warehouses
+  ) w ON p.warehouse_id = w.warehouse_id AND w.rn = 1 AND p.workspace_id = w.workspace_id
+  -- Latest Job Metadata
+  LEFT JOIN (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY workspace_id, job_id ORDER BY change_time DESC) rn
+    FROM system.lakeflow.jobs
+  ) j ON p.job_id = j.job_id AND j.rn = 1 AND p.workspace_id = j.workspace_id
+  -- Query History (SQL performance)
+  LEFT JOIN system.query.history qh 
+    ON p.warehouse_id IS NOT NULL 
+    AND p.workspace_id = qh.workspace_id 
+    AND p.usage_date = DATE(qh.start_time)
+    LIMIT 1  -- Approximate match for enrichment
+),
+
+-- 4. Aggregations at Multiple Levels
+daily_agg AS (
+  SELECT 
+    workspace_id,
+    usage_date,
+    identity_name,                  -- Key: User / Service Principal
+    job_name,                       -- Key: Which Job
+    cluster_name,                   -- Key: Which Compute
+    warehouse_name,                 -- Key: Which SQL Warehouse
+    billing_origin_product,
+    sku_name,
+    cluster_source,
+    warehouse_type,
+    is_serverless,
+    is_photon,
+    sql_tier,
+    jobs_tier,
+    SUM(usage_quantity) AS total_dbus,
+    ROUND(SUM(est_usd), 2) AS est_usd,
+    AVG(auto_termination_minutes) AS avg_auto_term_mins,
+    AVG(auto_stop_mins) AS avg_auto_stop_mins,
+    MAX(num_workers) AS max_workers,
+    COUNT(DISTINCT cluster_id) AS distinct_clusters,
+    COUNT(DISTINCT warehouse_id) AS distinct_warehouses,
+    AVG(total_duration_ms)/1000 AS avg_query_duration_sec,
+    ANY_VALUE(custom_tags) AS sample_tags
+  FROM enriched
+  GROUP BY ALL
+),
+
+weekly_agg AS (
+  SELECT 
+    workspace_id,
+    usage_week,
+    identity_name,
+    job_name,
+    cluster_name,
+    warehouse_name,
+    billing_origin_product,
+    SUM(total_dbus) AS weekly_dbus,
+    ROUND(SUM(est_usd), 2) AS weekly_usd,
+    AVG(total_dbus) AS avg_daily_dbus
+  FROM daily_agg
+  GROUP BY ALL
+),
+
+monthly_agg AS ( /* Similar to weekly but for month */ 
+  SELECT ... -- Implement similarly for monthly trends
+),
+
+-- 5. Trends & Growth
+trends AS (
+  SELECT 
+    identity_name,
+    job_name,
+    cluster_name,
+    warehouse_name,
+    billing_origin_product,
+    SUM(CASE WHEN usage_date >= CURRENT_DATE() - INTERVAL 7 DAYS THEN total_dbus ELSE 0 END) AS last_7d_dbus,
+    SUM(CASE WHEN usage_date BETWEEN CURRENT_DATE() - INTERVAL 14 DAYS AND CURRENT_DATE() - INTERVAL 7 DAYS THEN total_dbus ELSE 0 END) AS prev_7d_dbus,
+    ROUND(100.0 * (
+      SUM(CASE WHEN usage_date >= CURRENT_DATE() - INTERVAL 7 DAYS THEN total_dbus ELSE 0 END) - 
+      SUM(CASE WHEN usage_date BETWEEN CURRENT_DATE() - INTERVAL 14 DAYS AND CURRENT_DATE() - INTERVAL 7 DAYS THEN total_dbus ELSE 0 END)
+    ) / NULLIF(SUM(CASE WHEN usage_date BETWEEN CURRENT_DATE() - INTERVAL 14 DAYS AND CURRENT_DATE() - INTERVAL 7 DAYS THEN total_dbus ELSE 0 END), 0), 2) AS wow_growth_pct
+  FROM daily_agg
+  GROUP BY ALL
+)
+
+-- 6. FINAL SUPER 360° OUTPUT (Very Detailed)
+SELECT 
+  d.workspace_id,
+  d.usage_date,
+  d.identity_name,           -- User / Service Principal Focus
+  d.job_name,                -- Job Focus
+  d.cluster_name,            -- Compute Focus
+  d.warehouse_name,          -- SQL Warehouse Focus
+  d.billing_origin_product,
+  d.sku_name,
+  d.cluster_source,
+  d.warehouse_type,
+  d.total_dbus,
+  d.est_usd,
+  d.is_serverless,
+  d.is_photon,
+  d.avg_auto_term_mins,
+  d.avg_auto_stop_mins,
+  d.avg_query_duration_sec,
+  t.wow_growth_pct,
+  w.weekly_dbus,
+  w.weekly_usd,
+  
+  -- SUPER RECOMMENDATIONS (Rich & Prioritized)
+  CASE 
+    WHEN d.est_usd > 1000 THEN 'CRITICAL - Top Spender: '
+    WHEN t.wow_growth_pct > 50 THEN 'GROWTH ALERT - '
+    ELSE ''
+  END ||
+  CASE 
+    WHEN d.cluster_source = 'ALL_PURPOSE' 
+      THEN 'Migrate ' || COALESCE(d.job_name, 'workload') || ' from All-Purpose to Job Compute/Serverless (2-3x savings).'
+    WHEN d.warehouse_type != 'SERVERLESS' 
+      THEN 'Migrate SQL Warehouse ' || COALESCE(d.warehouse_name, '') || ' to Serverless. Set auto-stop 5-10 mins.'
+    WHEN d.is_photon = FALSE AND d.total_dbus > 300 
+      THEN 'Enable Photon + latest runtime on ' || COALESCE(d.cluster_name, d.warehouse_name, 'resource') || '.'
+    WHEN (d.avg_auto_term_mins IS NULL OR d.avg_auto_term_mins > 60) 
+      THEN 'Enforce auto-termination (≤30 min) via Cluster Policies on ' || COALESCE(d.cluster_name, 'clusters') || '.'
+    WHEN d.avg_query_duration_sec > 30 
+      THEN 'Optimize long-running queries on ' || COALESCE(d.warehouse_name, 'warehouse') || ' (check statement_text in query.history).'
+    ELSE 'Maintain strong tagging & policies. Review AWS CUR for full infra cost.'
+  END AS super_recommendation,
+
+  -- Full Action Plan
+  '1. Review identity ' || d.identity_name || ' usage. ' ||
+  '2. Tag resources (team/project). ' ||
+  '3. Enforce policies on ' || COALESCE(d.cluster_name, d.warehouse_name, 'compute') || '. ' ||
+  '4. Schedule alerts for >$500/day. ' ||
+  '5. Export to Power BI. Sample Tags: ' || COALESCE(d.sample_tags, 'N/A') AS detailed_action_plan
+
+FROM daily_agg d
+LEFT JOIN trends t 
+  ON d.identity_name = t.identity_name 
+ AND COALESCE(d.job_name, '') = COALESCE(t.job_name, '') 
+ AND COALESCE(d.cluster_name, '') = COALESCE(t.cluster_name, '')
+LEFT JOIN weekly_agg w 
+  ON d.workspace_id = w.workspace_id 
+ AND d.identity_name = w.identity_name 
+ AND COALESCE(d.job_name, '') = COALESCE(w.job_name, '')
+ORDER BY d.est_usd DESC, d.total_dbus DESC
+LIMIT 2000;
