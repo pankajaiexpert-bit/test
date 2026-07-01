@@ -1,0 +1,184 @@
+WITH 
+-- Base filtered usage (30-90 days; adjust for your volume)
+usage_base AS (
+  SELECT 
+    u.account_id,
+    u.workspace_id,
+    u.usage_date,
+    DATE_TRUNC('week', u.usage_date) AS usage_week,
+    DATE_TRUNC('month', u.usage_date) AS usage_month,
+    COALESCE(u.identity_metadata.run_as, u.identity_metadata.owned_by, 'UNKNOWN') AS identity_name,
+    u.billing_origin_product,
+    u.sku_name,
+    u.usage_quantity,
+    u.usage_metadata.cluster_id,
+    u.usage_metadata.warehouse_id,
+    u.usage_metadata.job_id,
+    u.usage_metadata.job_run_id,
+    u.usage_metadata.instance_pool_id,
+    u.product_features.is_serverless AS is_serverless,
+    u.product_features.is_photon AS is_photon,
+    u.custom_tags,
+    u.record_type
+  FROM system.billing.usage u
+  WHERE u.usage_date >= CURRENT_DATE() - INTERVAL 60 DAYS  -- Expandable
+    AND u.record_type = 'ORIGINAL'
+    AND u.usage_quantity > 0
+),
+
+-- Enrich with Pricing for USD
+priced AS (
+  SELECT 
+    ub.*,
+    COALESCE(lp.pricing.effective_list.default, 0) AS list_price_per_dbu,
+    ub.usage_quantity * COALESCE(lp.pricing.effective_list.default, 0) AS est_usd
+  FROM usage_base ub
+  LEFT JOIN system.billing.list_prices lp 
+    ON ub.sku_name = lp.sku_name 
+    AND ub.usage_date >= DATE(lp.price_start_time)
+    AND (lp.price_end_time IS NULL OR ub.usage_date < DATE(lp.price_end_time))
+),
+
+-- Enrich with Compute Metadata (latest cluster/warehouse state)
+compute_enriched AS (
+  SELECT 
+    p.*,
+    c.cluster_name,
+    c.cluster_source,  -- JOB, ALL_PURPOSE, etc.
+    c.owned_by AS cluster_owner,
+    c.auto_termination_minutes,
+    c.enable_elastic_disk,
+    w.warehouse_name,
+    w.warehouse_type,  -- PRO, CLASSIC, SERVERLESS
+    w.auto_stop_mins,
+    j.name AS job_name
+  FROM priced p
+  LEFT JOIN (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC) AS rn
+    FROM system.compute.clusters
+  ) c ON p.cluster_id = c.cluster_id AND c.rn = 1 AND p.workspace_id = c.workspace_id
+  LEFT JOIN (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY workspace_id, warehouse_id ORDER BY change_time DESC) AS rn
+    FROM system.compute.warehouses
+  ) w ON p.warehouse_id = w.warehouse_id AND w.rn = 1 AND p.workspace_id = w.workspace_id
+  LEFT JOIN (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY workspace_id, job_id ORDER BY change_time DESC) AS rn
+    FROM system.lakeflow.jobs
+  ) j ON p.job_id = j.job_id AND j.rn = 1 AND p.workspace_id = j.workspace_id
+),
+
+-- Core Aggregations
+agg_daily AS (
+  SELECT 
+    workspace_id,
+    usage_date,
+    identity_name,
+    billing_origin_product,
+    sku_name,
+    cluster_name,
+    warehouse_name,
+    job_name,
+    cluster_source,
+    warehouse_type,
+    is_serverless,
+    is_photon,
+    SUM(usage_quantity) AS total_dbus,
+    ROUND(SUM(est_usd), 2) AS est_usd,
+    MAX(auto_termination_minutes) AS auto_term_mins,
+    MAX(auto_stop_mins) AS auto_stop_mins,
+    COUNT(DISTINCT cluster_id) AS num_clusters,
+    COUNT(DISTINCT warehouse_id) AS num_warehouses,
+    ANY_VALUE(custom_tags) AS sample_tags
+  FROM compute_enriched
+  GROUP BY ALL
+),
+
+agg_weekly AS (
+  SELECT 
+    workspace_id,
+    usage_week,
+    identity_name,
+    billing_origin_product,
+    SUM(total_dbus) AS weekly_dbus,
+    ROUND(SUM(est_usd), 2) AS weekly_usd,
+    AVG(total_dbus) AS avg_daily_dbus
+  FROM agg_daily
+  GROUP BY workspace_id, usage_week, identity_name, billing_origin_product
+),
+
+-- Trends & Anomalies
+trends AS (
+  SELECT 
+    identity_name,
+    billing_origin_product,
+    SUM(CASE WHEN usage_date >= CURRENT_DATE() - 7 THEN total_dbus ELSE 0 END) AS last_7d_dbus,
+    SUM(CASE WHEN usage_date BETWEEN CURRENT_DATE() - 14 AND CURRENT_DATE() - 7 THEN total_dbus ELSE 0 END) AS prev_7d_dbus,
+    ROUND(
+      (SUM(CASE WHEN usage_date >= CURRENT_DATE() - 7 THEN total_dbus ELSE 0 END) - 
+       SUM(CASE WHEN usage_date BETWEEN CURRENT_DATE() - 14 AND CURRENT_DATE() - 7 THEN total_dbus ELSE 0 END)) * 100.0 /
+      NULLIF(SUM(CASE WHEN usage_date BETWEEN CURRENT_DATE() - 14 AND CURRENT_DATE() - 7 THEN total_dbus ELSE 0 END), 0)
+    , 2) AS wow_growth_pct
+  FROM agg_daily
+  GROUP BY identity_name, billing_origin_product
+)
+
+-- FINAL SUPER 360° REPORT
+SELECT 
+  a.workspace_id,
+  a.usage_date,
+  a.identity_name,
+  a.billing_origin_product,
+  a.sku_name,
+  a.cluster_name,
+  a.warehouse_name,
+  a.job_name,
+  a.cluster_source,
+  a.warehouse_type,
+  a.total_dbus,
+  a.est_usd,
+  a.is_serverless,
+  a.is_photon,
+  t.wow_growth_pct,
+  w.weekly_dbus,
+  w.weekly_usd,
+  
+  -- SUPER RECOMMENDATIONS (rich, prioritized logic)
+  CASE 
+    WHEN a.est_usd > 500 AND a.cluster_source = 'ALL_PURPOSE' 
+      THEN 'CRITICAL: Immediate migration from All-Purpose to Job Compute (2-3x cheaper). Use serverless jobs.'
+    WHEN a.is_serverless = FALSE AND (a.auto_term_mins IS NULL OR a.auto_term_mins > 60) 
+      THEN 'HIGH: Enable/lower auto-termination (30 min max). Use Cluster Policies to enforce.'
+    WHEN a.warehouse_type != 'SERVERLESS' AND a.num_warehouses > 1 
+      THEN 'HIGH: Migrate SQL workloads to Serverless Warehouses. Set auto-stop 5-10 min. Right-size dynamically.'
+    WHEN a.is_photon = FALSE AND a.total_dbus > 500 
+      THEN 'MEDIUM-HIGH: Enable Photon + upgrade to latest DBR runtime (significant perf/cost gains).'
+    WHEN t.wow_growth_pct > 50 
+      THEN 'ALERT: Explosive growth (>50% WoW) - Investigate root cause, set Budgets API alerts, enforce tags.'
+    WHEN a.num_clusters > 3 OR a.num_warehouses > 2 
+      THEN 'MEDIUM: Consolidate resources. Adopt Instance Pools + AWS Graviton2/Fleet for price-performance.'
+    WHEN a.billing_origin_product IN ('ALL_PURPOSE', 'INTERACTIVE') 
+      THEN 'STRATEGIC: Shift dev/interactive to dedicated low-cost compute. Use Usage Policies for serverless.'
+    WHEN a.est_usd > 100 AND a.is_serverless = TRUE 
+      THEN 'OPTIMIZE: Review serverless usage policies, add custom tags for chargeback.'
+    ELSE 'GREEN: Excellent. Continue enforcing tags, policies, and monitor AWS CUR for full infra costs (EC2/EBS).'
+  END AS super_recommendation,
+
+  -- Detailed Next Steps (360° actionable)
+  CONCAT(
+    '1. Tag everything (team/project/owner). ',
+    '2. Implement Cluster/Usage Policies. ',
+    '3. Review system.compute.clusters for idle resources. ',
+    '4. Join with AWS CUR for total cloud cost. ',
+    '5. Schedule this query + alerts. ',
+    'Sample Tags: ', COALESCE(a.sample_tags, 'None')
+  ) AS action_plan
+
+FROM agg_daily a
+LEFT JOIN trends t ON a.identity_name = t.identity_name AND a.billing_origin_product = t.billing_origin_product
+LEFT JOIN agg_weekly w ON a.workspace_id = w.workspace_id 
+  AND a.identity_name = w.identity_name 
+  AND a.billing_origin_product = w.billing_origin_product 
+  AND a.usage_week = w.usage_week
+WHERE a.est_usd > 10  -- Focus on meaningful spend
+ORDER BY a.est_usd DESC, a.total_dbus DESC
+LIMIT 1000;
